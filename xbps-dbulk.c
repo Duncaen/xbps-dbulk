@@ -704,8 +704,7 @@ buildstart(struct job *j, struct srcpkg *srcpkg)
 err2:
 	posix_spawn_file_actions_destroy(&actions);
 err1:
-	/* close(fd[0]); */
-	/* close(fd[1]); */
+	close(fd);
 err0:
 	return -1;
 }
