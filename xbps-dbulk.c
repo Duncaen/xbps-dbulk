@@ -161,11 +161,6 @@ mksrcpkg(struct pkgname *pkgname)
 	return srcpkg;
 }
 
-static struct srcpkg *
-getsrcpkg(const char *name)
-{
-}
-
 static void
 pkgnamestat(struct pkgname *pkgname)
 {
@@ -609,10 +604,6 @@ gendepstart(struct job *j, struct srcpkg *srcpkg)
 	close(stdoutfd);
 	close(stderrfd);
 
-	/* if (e->pool == &consolepool) */
-	/* 	consoleused = true; */
-	/* fprintf(stderr, "started job: pid=%zu\n", j->pid); */
-
 	return 0;
 
 err2:
@@ -673,8 +664,6 @@ buildstart(struct job *j, struct srcpkg *srcpkg)
 	posix_spawn_file_actions_t actions;
 	char *const argv[] = {xbps_src, "pkg", "-1Et", "-j", "4", srcpkg->pkgname->name, NULL};
 	int fd;
-
-	/* fprintf(stderr, "jobstart: pkg %s\n", srcpkg->pkgname->name); */
 
 	j->failed = false;
 	j->srcpkg = srcpkg;
@@ -781,7 +770,6 @@ again:
 				continue;
 			}
 
-			/* fprintf(stderr, "[%zu/%zu] pkg %s\n", numfinished, numtotal, srcpkg->pkgname->name); */
 			if (jobstart(&jobs[next], srcpkg) == -1) {
 				fprintf(stderr, "job failed to start: %s\n", srcpkg->pkgname->name);
 				numfail++;
@@ -800,7 +788,6 @@ again:
 			perror("waitpid");
 			exit(1);
 		}
-		/* fprintf(stderr, "pid: %d\n", pid); */
 
 		for (size_t i = 0; i < maxjobs; i++) {
 			if (jobs[i].pid != pid)
