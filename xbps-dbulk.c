@@ -762,7 +762,7 @@ build(void)
 	}
 
 	for (;;) {
-again:
+nextjob:
 		while (work && numjobs < maxjobs) {
 			struct srcpkg *srcpkg = work;
 			work = work->worknext;
@@ -786,27 +786,29 @@ again:
 		if (numjobs == 0)
 			break;
 
-		int status;
-		pid_t pid = waitpid(-1, &status, 0);
-		if (pid == -1) {
-			perror("waitpid");
-			exit(1);
-		}
+		for (;;) {
+			int status;
+			pid_t pid = waitpid(-1, &status, 0);
+			if (pid == -1) {
+				perror("waitpid");
+				exit(1);
+			}
 
-		for (size_t i = 0; i < maxjobs; i++) {
-			if (jobs[i].pid != pid)
-				continue;
-			const char *action = jobs[i].srcpkg->flags & FLAG_DEPS ? "build package" : "generated dependencies for";
-			jobs[i].status = status;
-			jobdone(&jobs[i]);
-			numjobs--;
-			jobs[i].next = next;
-			jobs[i].pid = -1;
-			next = i;
-			if (jobs[i].failed)
-				numfail++;
-			fprintf(stderr, "[%zu/%zu] %s %s\n", numfinished, numtotal, action, jobs[i].srcpkg->pkgname->name);
-			goto again;
+			for (size_t i = 0; i < maxjobs; i++) {
+				if (jobs[i].pid != pid)
+					continue;
+				const char *action = jobs[i].srcpkg->flags & FLAG_DEPS ? "build package" : "generated dependencies for";
+				jobs[i].status = status;
+				jobdone(&jobs[i]);
+				numjobs--;
+				jobs[i].next = next;
+				jobs[i].pid = -1;
+				next = i;
+				if (jobs[i].failed)
+					numfail++;
+				fprintf(stderr, "[%zu/%zu] %s %s\n", numfinished, numtotal, action, jobs[i].srcpkg->pkgname->name);
+				goto nextjob;
+			}
 		}
 	}
 }
