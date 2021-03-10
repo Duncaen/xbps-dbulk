@@ -84,8 +84,7 @@ struct pool {
 	struct srcpkg *work;
 };
 
-static const char *distdir = "/home/duncan/void-packages";
-static char *xbps_src = "/home/duncan/void-packages/xbps-src";
+static const char *distdir;
 
 static struct pkgname *pkgnames;
 static struct srcpkg *srcpkgs;
@@ -560,7 +559,7 @@ gendepstart(struct job *j, struct srcpkg *srcpkg)
 	extern char **environ;
 	char path[PATH_MAX];
 	posix_spawn_file_actions_t actions;
-	char *const argv[] = {xbps_src, "dbulk-dump", srcpkg->pkgname->name, NULL};
+	char *argv[] = {NULL, "dbulk-dump", srcpkg->pkgname->name, NULL};
 	int stdoutfd, stderrfd;
 
 	j->failed = false;
@@ -579,6 +578,9 @@ gendepstart(struct job *j, struct srcpkg *srcpkg)
 		fprintf(stderr, "open: %s: %s\n", path, strerror(errno));
 		exit(1);
 	}
+
+	xsnprintf(path, sizeof path, "%s/xbps-src", distdir);
+	argv[0] = path;
 
 	if ((errno = posix_spawn_file_actions_init(&actions))) {
 		perror("posix_spawn_file_actions_init");
@@ -662,7 +664,7 @@ buildstart(struct job *j, struct srcpkg *srcpkg)
 	extern char **environ;
 	char path[PATH_MAX];
 	posix_spawn_file_actions_t actions;
-	char *const argv[] = {xbps_src, "pkg", "-1Et", "-j", "4", srcpkg->pkgname->name, NULL};
+	char *argv[] = {NULL, "pkg", "-1Et", "-j", "4", srcpkg->pkgname->name, NULL};
 	int fd;
 
 	j->failed = false;
@@ -675,6 +677,9 @@ buildstart(struct job *j, struct srcpkg *srcpkg)
 		perror("open");
 		exit(1);
 	}
+
+	xsnprintf(path, sizeof path, "%s/xbps-src", distdir);
+	argv[0] = path;
 
 	if ((errno = posix_spawn_file_actions_init(&actions))) {
 		perror("posix_spawn_file_actions_init");
@@ -1014,10 +1019,13 @@ main(int argc, char *argv[])
 	int c;
 	unsigned long ul;
 
-	while ((c = getopt(argc, argv, "dj:n")) != -1)
+	while ((c = getopt(argc, argv, "dD:j:n")) != -1)
 		switch (c) {
 		case 'd':
 			explain = true;
+			break;
+		case 'D':
+			distdir = optarg;
 			break;
 		case 'j':
 			errno = 0;
@@ -1032,11 +1040,22 @@ main(int argc, char *argv[])
 			dryrun = true;
 			break;
 		default:
-			fprintf(stderr, "usage: %s [-den] [-j jobs] [target...]\n", *argv);
+			fprintf(stderr, "usage: %s [-den] [-D distdir] [-j jobs] [target...]\n", *argv);
 		}
 
 	argc -= optind;
 	argv += optind;
+
+	if (!distdir) {
+		static char defdistdir[PATH_MAX];
+		const char *home;
+		if (!(home = getenv("HOME"))) {
+			fprintf(stderr, "getenv: HOME: not defined\n");
+			exit(1);
+		}
+		xsnprintf(defdistdir, sizeof defdistdir, "%s/void-packages", home);
+		distdir = defdistdir;
+	}
 
 	if (mkdir("logs", 0755) == -1 && errno != EEXIST) {
 		fprintf(stderr, "mkdir: %s: %s\n", "logs", strerror(errno));
