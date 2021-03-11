@@ -372,6 +372,18 @@ addtargetdep(struct srcpkg *srcpkg, const char *name)
 	pkgnameuse(dep, srcpkg);
 }
 
+static void
+addsubpkg(struct srcpkg *srcpkg, const char *name)
+{
+	struct pkgname *sub = mkpkgname(name);
+	srcpkg->subpkgs = reallocarray(srcpkg->subpkgs, srcpkg->nsubpkgs+1, sizeof *srcpkg->subpkgs);
+	if (!srcpkg->subpkgs) {
+		perror("reallocarray");
+		exit(1);
+	}
+	srcpkg->subpkgs[srcpkg->nsubpkgs++] = sub;
+}
+
 static int
 readdeps(struct srcpkg *srcpkg, FILE *fp)
 {
@@ -401,10 +413,10 @@ readdeps(struct srcpkg *srcpkg, FILE *fp)
 					/* fallthrough */
 				case Stargdep:
 					addtargetdep(srcpkg, line+1);
+					break;
 				case Ssubpkgs:
-					continue;
-				default:
-					continue;
+					addsubpkg(srcpkg, line+1);
+					break;
 				}
 				continue;
 			}
