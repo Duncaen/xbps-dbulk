@@ -1057,12 +1057,38 @@ scan(void)
 	close(dirfd);
 }
 
+static int
+mkpath(const char *path, mode_t mode)
+{
+	char tmp[PATH_MAX];
+	char *slash = tmp;
+	bool done = false;
+	size_t l = strlcpy(tmp, path, sizeof tmp);
+	if (l >= sizeof tmp) {
+		errno = ENOBUFS;
+		return -1;
+	}
+	while (!done) {
+		slash += strspn(slash, "/");
+		slash += strcspn(slash, "/");
+		done = (*slash == '\0');
+		*slash = '\0';
+		if (mkdir(tmp, mode) == -1) {
+			if (errno != EEXIST)
+				return -1;
+		}
+		*slash = '/';
+	}
+}
+
 int
 main(int argc, char *argv[])
 {
+	char path[PATH_MAX];
 	int c;
 	unsigned long ul;
 	const char *tool = NULL;
+	struct builder *builder, *tmpbuilder;
 
 	while ((c = getopt(argc, argv, "dD:j:nt:")) != -1)
 		switch (c) {
@@ -1109,13 +1135,24 @@ main(int argc, char *argv[])
 		distdir = defdistdir;
 	}
 
-	if (mkdir("logs", 0755) == -1 && errno != EEXIST) {
-		fprintf(stderr, "mkdir: %s: %s\n", "logs", strerror(errno));
-		exit(1);
-	}
-	if (mkdir("deps", 0755) == -1 && errno != EEXIST) {
-		fprintf(stderr, "mkdir: %s: %s\n", "deps", strerror(errno));
-		exit(1);
+	/* setup the state directories */
+	HASH_ITER(hh, builders, builder, tmpbuilder) {
+		if (builder->host)
+			xsnprintf(path, sizeof path, "logs/%s@%s", builder->arch, builder->host->arch);
+		else
+			xsnprintf(path, sizeof path, "logs/%s", builder->arch);
+		if (mkpath(path, 0755) == -1) {
+			fprintf(stderr, "mkpath: %s: %s\n", path, strerror(errno));
+			exit(1);
+		}
+		if (builder->host)
+			xsnprintf(path, sizeof path, "deps/%s@%s", builder->arch, builder->host->arch);
+		else
+			xsnprintf(path, sizeof path, "deps/%s", builder->arch);
+		if (mkpath(path, 0755) == -1) {
+			fprintf(stderr, "mkpath: %s: %s\n", path, strerror(errno));
+			exit(1);
+		}
 	}
 
 	if (argc > 0) {
