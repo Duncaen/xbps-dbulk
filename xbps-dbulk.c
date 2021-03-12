@@ -860,7 +860,7 @@ _buildadd(struct pkgname *pkgname, struct builder *builder)
 			 * to prioritize building packages over generating deps in
 			 * case we have an old dep file? */
 			if (explain)
-				fprintf(stderr, "explain %s: dependency file %s\n", build->pkgname->name,
+				fprintf(stderr, "explain %s@%s: dependency file %s\n", build->pkgname->name, build->builder->arch,
 				    build->depmtime == MTIME_MISSING ? "missing" : "older than template");
 			build->flags |= FLAG_DIRTY;
 			build->nblock = 0;
@@ -868,7 +868,7 @@ _buildadd(struct pkgname *pkgname, struct builder *builder)
 		} else {
 			build->flags |= FLAG_SKIP|FLAG_DIRTY;
 			if (explain)
-				fprintf(stderr, "explain %s: skipping, template unchanged since previous error\n", build->pkgname->name);
+				fprintf(stderr, "explain %s@%s: skipping, template unchanged since previous error\n", build->pkgname->name, build->builder->arch);
 			goto out;
 		}
 	}
@@ -880,17 +880,17 @@ _buildadd(struct pkgname *pkgname, struct builder *builder)
 			if (build->logerrmtime == MTIME_MISSING) {
 				/* Build the package if log and error mtime are missing */
 				if (explain)
-					fprintf(stderr, "explain %s: missing\n", build->pkgname->name);
+					fprintf(stderr, "explain %s@%s: missing\n", build->pkgname->name, build->builder->arch);
 				build->flags |= FLAG_DIRTY;
 			} else if (build->logerrmtime < build->pkgname->mtime) {
 				/* Build the package if log mtime is missing and error mtime is older than the template */
 				if (explain)
-					fprintf(stderr, "explain %s: reattempt, template changed since previous error\n", build->pkgname->name);
+					fprintf(stderr, "explain %s@%s: reattempt, template changed since previous error\n", build->pkgname->name, build->builder->arch, build->pkgname->name);
 				build->flags |= FLAG_DIRTY;
 			} else {
 				build->flags |= FLAG_SKIP|FLAG_DIRTY;
 				if (explain)
-					fprintf(stderr, "explain %s: skipping, template unchanged since previous error\n", build->pkgname->name);
+					fprintf(stderr, "explain %s@%s: skipping, template unchanged since previous error\n", build->pkgname->name, build->builder->arch, build->pkgname->name);
 				goto out;
 			}
 		}
