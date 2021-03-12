@@ -32,20 +32,30 @@
 size_t strlcpy(char *dst, const char *src, size_t dsize);
 #endif
 
+struct builder {
+	char *arch;
+	struct builder *host;
+	char *masterdir;
+	UT_hash_handle hh;
+};
+
 struct pkgname {
 	char *name;
+	struct pkgname *srcpkg;
 	size_t nuse;
-	struct srcpkg **use;
-	struct srcpkg *srcpkg;
+	struct build **use;
+	size_t nbuilds;
+	struct build **builds;
 	time_t mtime;
 	bool dirty;
 	UT_hash_handle hh;
 };
 
-struct srcpkg {
+struct build {
 	struct pkgname *pkgname;
 	char *version;
 	char *revision;
+	struct builder *builder;
 
 	size_t nhostdeps;
 	struct pkgname **hostdeps;
@@ -69,8 +79,8 @@ struct srcpkg {
 		FLAG_SKIP  = 1 << 4,
 	} flags;
 
-	struct srcpkg *allnext;
-	struct srcpkg *worknext;
+	struct build *allnext;
+	struct build *worknext;
 };
 
 enum {
@@ -87,7 +97,9 @@ struct pool {
 static const char *distdir;
 
 static struct pkgname *pkgnames;
-static struct srcpkg *srcpkgs;
+static struct builder *builders;
+static struct build *builds;
+static struct build *work;
 
 static size_t numtotal;
 static bool explain;
@@ -130,6 +142,19 @@ xsnprintf(char *buf, size_t buflen, const char *fmt, ...)
 	}
 }
 
+static struct builder *
+mkbuilder(const char *arch)
+{
+	struct builder *b;
+	HASH_FIND_STR(builders, arch, b);
+	if (!b) {
+		b = xzmalloc(sizeof *b);
+		b->arch = xstrdup(arch);
+		HASH_ADD_STR(builders, arch, b);
+	}
+	return b;
+}
+
 static struct pkgname *
 mkpkgname(const char *name)
 {
@@ -143,21 +168,6 @@ mkpkgname(const char *name)
 		HASH_ADD_STR(pkgnames, name, n);
 	}
 	return n;
-}
-
-static struct srcpkg *
-mksrcpkg(struct pkgname *pkgname)
-{
-	struct srcpkg *srcpkg;
-	srcpkg = xzmalloc(sizeof *srcpkg);
-	srcpkg->pkgname = pkgname;
-	srcpkg->allnext = srcpkgs;
-	srcpkg->depmtime = MTIME_UNKNOWN;
-	srcpkg->deperrmtime = MTIME_UNKNOWN;
-	srcpkg->logmtime = MTIME_UNKNOWN;
-	srcpkg->logerrmtime = MTIME_UNKNOWN;
-	srcpkgs = srcpkg;
-	return srcpkg;
 }
 
 static void
@@ -175,11 +185,12 @@ pkgnamestat(struct pkgname *pkgname)
 				/* XXX: -32bit should be handled differently */
 				if (strcmp(p, "-dbg") == 0 || strcmp(p, "-32bit") == 0) {
 					strlcpy(buf, pkgname->name, p-pkgname->name+1);
-					struct pkgname *srcpkgname = mkpkgname(buf);
-					if (!srcpkgname->srcpkg) {
-						srcpkgname->srcpkg = mksrcpkg(srcpkgname);
-					}
-					pkgname->srcpkg = srcpkgname->srcpkg;
+					pkgname->srcpkg = mkpkgname(buf);
+					if (pkgname->srcpkg->mtime == MTIME_UNKNOWN)
+						pkgnamestat(pkgname->srcpkg);
+					/* use the source packages mtime */
+					pkgname->mtime = pkgname->srcpkg->mtime;
+					return;
 				}
 			}
 		}
@@ -189,6 +200,26 @@ pkgnamestat(struct pkgname *pkgname)
 	if (st.st_mode & S_IFLNK) {
 		/* if this is a subpackage, use the symlinks mtime */
 		pkgname->mtime = st.st_mtime;
+		if (!pkgname->srcpkg) {
+			ssize_t len;
+			if ((len = readlink(buf, buf, sizeof buf)) == -1) {
+				perror("readlink");
+				exit(1);
+			}
+			if ((size_t)len >= sizeof buf) {
+				errno = ENOBUFS;
+				perror("readlink");
+				exit(1);
+			}
+			buf[len] = '\0';
+			if (len > 0 && buf[len-1] == '/') {
+				fprintf(stderr, "warn: symlink `%s/srcpkgs/%s` contains trailing slash.\n", distdir, pkgname->name);
+				buf[len-1] = '\0';
+			}
+			pkgname->srcpkg = mkpkgname(buf);
+			if (pkgname->srcpkg->mtime == MTIME_UNKNOWN)
+				pkgnamestat(pkgname->srcpkg);
+		}
 		return;
 	}
 	if (st.st_mode & S_IFDIR) {
@@ -203,189 +234,137 @@ pkgnamestat(struct pkgname *pkgname)
 }
 
 static void
-depstat(struct srcpkg *srcpkg)
+depstat(struct build *build)
 {
 	char buf[PATH_MAX];
 	struct stat st;
 
-	srcpkg->depmtime = MTIME_MISSING;
-	srcpkg->deperrmtime = MTIME_MISSING;
+	build->depmtime = MTIME_MISSING;
+	build->deperrmtime = MTIME_MISSING;
 
-	xsnprintf(buf, sizeof buf, "deps/%s.dep", srcpkg->pkgname->name);
+	if (build->builder->host)
+		xsnprintf(buf, sizeof buf, "deps/%s@%s/%s.dep", build->builder->arch, build->builder->host->arch, build->pkgname->name);
+	else
+		xsnprintf(buf, sizeof buf, "deps/%s/%s.dep", build->builder->arch, build->pkgname->name);
 	if (stat(buf, &st) == -1) {
 		if (errno != ENOENT) {
 			perror("stat");
 			exit(1);
 		}
 	} else {
-		srcpkg->depmtime = st.st_mtime;
+		build->depmtime = st.st_mtime;
 	}
-	xsnprintf(buf, sizeof buf, "deps/%s.err", srcpkg->pkgname->name);
+	if (build->builder->host)
+		xsnprintf(buf, sizeof buf, "deps/%s@%s/%s.err", build->builder->arch, build->builder->host->arch, build->pkgname->name);
+	else
+		xsnprintf(buf, sizeof buf, "deps/%s/%s.err", build->builder->arch, build->pkgname->name);
 	if (stat(buf, &st) == -1) {
 		if (errno != ENOENT) {
 			perror("stat");
 			exit(1);
 		}
 	} else {
-		srcpkg->deperrmtime = st.st_mtime;
+		build->deperrmtime = st.st_mtime;
 	}
 }
 
 static void
-logstat(struct srcpkg *srcpkg)
+logstat(struct build *build)
 {
 	char buf[PATH_MAX];
 	struct stat st;
 
-	srcpkg->logmtime = MTIME_MISSING;
-	srcpkg->logerrmtime = MTIME_MISSING;
+	build->logmtime = MTIME_MISSING;
+	build->logerrmtime = MTIME_MISSING;
 
-	if (!srcpkg->version || !srcpkg->revision)
+	if (!build->version || !build->revision)
 		return;
 
-	xsnprintf(buf, sizeof buf, "logs/%s-%s_%s.log", srcpkg->pkgname->name, srcpkg->version, srcpkg->revision);
+	if (build->builder->host)
+		xsnprintf(buf, sizeof buf, "logs/%s@%s/%s-%s_%s.log", build->builder->arch, build->builder->host->arch, build->pkgname->name, build->version, build->revision);
+	else
+		xsnprintf(buf, sizeof buf, "logs/%s/%s-%s_%s.log", build->builder->arch, build->pkgname->name, build->version, build->revision);
 	if (stat(buf, &st) == 0) {
-		srcpkg->logmtime = st.st_mtime;
+		build->logmtime = st.st_mtime;
 	} else if (errno != ENOENT) {
 		fprintf(stderr, "stat: %s: %s\n", buf, strerror(errno));
 		exit(1);
 	}
 
-	xsnprintf(buf, sizeof buf, "logs/%s-%s_%s.err", srcpkg->pkgname->name, srcpkg->version, srcpkg->revision);
+	if (build->builder->host)
+		xsnprintf(buf, sizeof buf, "logs/%s@%s/%s-%s_%s.err", build->builder->arch, build->builder->host->arch, build->pkgname->name, build->version, build->revision);
+	else
+		xsnprintf(buf, sizeof buf, "logs/%s/%s-%s_%s.err", build->builder->arch, build->pkgname->name, build->version, build->revision);
 	if (stat(buf, &st) == 0) {
-		srcpkg->logerrmtime = st.st_mtime;
+		build->logerrmtime = st.st_mtime;
 	} else if (errno != ENOENT) {
 		fprintf(stderr, "stat: %s: %s\n", buf, strerror(errno));
 		exit(1);
 	}
-}
-
-static struct pkgname *
-addpkg(const char *name)
-{
-	char buf[PATH_MAX];
-	struct pkgname *pkgname;
-
-	pkgname = mkpkgname(name);
-	if (pkgname->srcpkg)
-		return pkgname;
-
-	xsnprintf(buf, sizeof buf, "%s/srcpkgs/%s", distdir, name);
-
-	struct stat st;
-	if (lstat(buf, &st) == -1) {
-		if (errno == ENOENT) {
-			const char *p;
-			if ((p = strrchr(name, '-'))) {
-				if (strcmp(p, "-dbg") == 0 || strcmp(p, "-32bit") == 0) {
-					strlcpy(buf, name, p-name+1);
-					struct pkgname *srcpkgname = mkpkgname(buf);
-					if (!srcpkgname->srcpkg) {
-						srcpkgname->srcpkg = mksrcpkg(srcpkgname);
-					}
-					pkgname->srcpkg = srcpkgname->srcpkg;
-					return pkgname;
-				}
-			}
-		}
-		fprintf(stderr, "lstat: %s: %s\n", buf, strerror(errno));
-		exit(1);
-	}
-	if (st.st_mode & S_IFDIR) {
-		xsnprintf(buf, sizeof buf, "%s/srcpkgs/%s/template", distdir, name);
-		if (stat(buf, &st) == -1) {
-			fprintf(stderr, "perror: %s: %s\n", buf, strerror(errno));
-			exit(1);
-		}
-		pkgname->mtime = st.st_mtime;
-		pkgname->srcpkg = mksrcpkg(pkgname);
-		return pkgname;
-	}
-	if (st.st_mode & S_IFLNK) {
-		pkgname->mtime = st.st_mtime;
-		ssize_t len;
-		if ((len = readlink(buf, buf, sizeof buf)) == -1) {
-			perror("readlink");
-			exit(1);
-		}
-
-		if ((size_t)len >= sizeof buf) {
-			errno = ENOBUFS;
-			perror("readlink");
-			exit(1);
-		}
-		buf[len] = '\0';
-
-		if (len > 0 && buf[len-1] == '/') {
-			fprintf(stderr, "warn: symlink `%s/srcpkgs/%s` contains trailing slash.\n", distdir, name);
-			buf[len-1] = '\0';
-		}
-		struct pkgname *srcpkgname = mkpkgname(buf);
-		if (!srcpkgname->srcpkg) {
-			srcpkgname->srcpkg = mksrcpkg(srcpkgname);
-		}
-		pkgname->srcpkg = srcpkgname->srcpkg;
-	} else {
-		fprintf(stderr, "unexpected file type: %s\n", buf);
-		exit(1);
-	}
-
-	return pkgname;
 }
 
 static void
-pkgnameuse(struct pkgname *pkgname, struct srcpkg *srcpkg)
+pkgnamebuild(struct pkgname *pkgname, struct build *build)
+{
+	pkgname->builds = reallocarray(pkgname->builds, pkgname->nbuilds+1, sizeof *pkgname->builds);
+	if (!pkgname->builds) {
+		perror("reallocarray");
+		exit(1);
+	}
+	pkgname->builds[pkgname->nbuilds++] = build;
+}
+
+static void
+pkgnameuse(struct pkgname *pkgname, struct build *build)
 {
 	pkgname->use = reallocarray(pkgname->use, pkgname->nuse+1, sizeof *pkgname->use);
 	if (!pkgname->use) {
 		perror("reallocarray");
 		exit(1);
 	}
-	pkgname->use[pkgname->nuse++] = srcpkg;
+	pkgname->use[pkgname->nuse++] = build;
 }
 
-static struct srcpkg *work;
-
 static void
-addhostdep(struct srcpkg *srcpkg, const char *name)
+addhostdep(struct build *build, const char *name)
 {
-	struct pkgname *dep = addpkg(name);
-	srcpkg->hostdeps = reallocarray(srcpkg->hostdeps, srcpkg->nhostdeps+1, sizeof *srcpkg->hostdeps);
-	if (!srcpkg->hostdeps) {
+	struct pkgname *dep = mkpkgname(name);
+	build->hostdeps = reallocarray(build->hostdeps, build->nhostdeps+1, sizeof *build->hostdeps);
+	if (!build->hostdeps) {
 		perror("reallocarray");
 		exit(1);
 	}
-	srcpkg->hostdeps[srcpkg->nhostdeps++] = dep;
-	pkgnameuse(dep, srcpkg);
+	build->hostdeps[build->nhostdeps++] = dep;
+	pkgnameuse(dep, build);
 }
 
 static void
-addtargetdep(struct srcpkg *srcpkg, const char *name)
+addtargetdep(struct build *build, const char *name)
 {
-	struct pkgname *dep = addpkg(name);
-	srcpkg->targetdeps = reallocarray(srcpkg->targetdeps, srcpkg->ntargetdeps+1, sizeof *srcpkg->targetdeps);
-	if (!srcpkg->targetdeps) {
+	struct pkgname *dep = mkpkgname(name);
+	build->targetdeps = reallocarray(build->targetdeps, build->ntargetdeps+1, sizeof *build->targetdeps);
+	if (!build->targetdeps) {
 		perror("reallocarray");
 		exit(1);
 	}
-	srcpkg->targetdeps[srcpkg->ntargetdeps++] = dep;
-	pkgnameuse(dep, srcpkg);
+	build->targetdeps[build->ntargetdeps++] = dep;
+	pkgnameuse(dep, build);
 }
 
 static void
-addsubpkg(struct srcpkg *srcpkg, const char *name)
+addsubpkg(struct build *build, const char *name)
 {
 	struct pkgname *sub = mkpkgname(name);
-	srcpkg->subpkgs = reallocarray(srcpkg->subpkgs, srcpkg->nsubpkgs+1, sizeof *srcpkg->subpkgs);
-	if (!srcpkg->subpkgs) {
+	build->subpkgs = reallocarray(build->subpkgs, build->nsubpkgs+1, sizeof *build->subpkgs);
+	if (!build->subpkgs) {
 		perror("reallocarray");
 		exit(1);
 	}
-	srcpkg->subpkgs[srcpkg->nsubpkgs++] = sub;
+	build->subpkgs[build->nsubpkgs++] = sub;
 }
 
 static int
-readdeps(struct srcpkg *srcpkg, FILE *fp)
+readdeps(struct build *build, FILE *fp)
 {
 	const char *d;
 	char *line = NULL;
@@ -407,15 +386,15 @@ readdeps(struct srcpkg *srcpkg, FILE *fp)
 			if (*line == ' ') {
 				switch (state & ~Sarray) {
 				case Shostdep:
-					addhostdep(srcpkg, line+1);
+					addhostdep(build, line+1);
 					break;
 				case Smakedep:
 					/* fallthrough */
 				case Stargdep:
-					addtargetdep(srcpkg, line+1);
+					addtargetdep(build, line+1);
 					break;
 				case Ssubpkgs:
-					addsubpkg(srcpkg, line+1);
+					addsubpkg(build, line+1);
 					break;
 				}
 				continue;
@@ -443,11 +422,11 @@ readdeps(struct srcpkg *srcpkg, FILE *fp)
 		if (strncmp("pkgname", line, d-line) == 0) {
 			/* XXX: check if pkgname matches? */
 		} else if (strncmp("version", line, d-line) == 0) {
-			free(srcpkg->version);
-			srcpkg->version = xstrdup(d+2);
+			free(build->version);
+			build->version = xstrdup(d+2);
 		} else if (strncmp("revision", line, d-line) == 0) {
-			free(srcpkg->revision);
-			srcpkg->revision = xstrdup(d+2);
+			free(build->revision);
+			build->revision = xstrdup(d+2);
 		} else {
 			/* fprintf(stderr, "key: %.*s value: %s\n", d-line, line, d+2); */
 		}
@@ -456,48 +435,38 @@ readdeps(struct srcpkg *srcpkg, FILE *fp)
 }
 
 static void
-queue(struct srcpkg *srcpkg)
+queue(struct build *build)
 {
-	struct srcpkg **front = &work;
-	srcpkg->worknext = *front;
-	*front = srcpkg;
+	struct build **front = &work;
+	build->worknext = *front;
+	*front = build;
 }
 
 static void
-loaddeps(struct srcpkg *srcpkg)
+loaddeps(struct build *build)
 {
 	char path[PATH_MAX];
 	struct stat st;
 
-	if (srcpkg->flags & FLAG_DEPS)
+	if (build->flags & FLAG_DEPS)
 		return;
 
-	xsnprintf(path, sizeof path, "deps/%s.dep", srcpkg->pkgname->name);
+	if (build->builder->host)
+		xsnprintf(path, sizeof path, "deps/%s@%s/%s.dep", build->builder->arch, build->builder->host->arch, build->pkgname->name);
+	else
+		xsnprintf(path, sizeof path, "deps/%s/%s.dep", build->builder->arch, build->pkgname->name);
 	FILE *fp = fopen(path, "r");
 	if (fp == NULL) {
-		fprintf(stderr, "fopen: %s: %s", path, strerror(errno));
+		fprintf(stderr, "fopen: %s: %s\n", path, strerror(errno));
 		exit(1);
 	}
-	if (readdeps(srcpkg, fp) == -1) {
+	if (readdeps(build, fp) == -1) {
 		perror("readdeps");
 		exit(1);
 	}
 	fclose(fp);
 
-	srcpkg->flags |= FLAG_DEPS;
-}
-
-static void
-pkgnamedone(struct pkgname *pkgname, bool prune)
-{
-	for (size_t i = 0; i < pkgname->nuse; ++i) {
-		struct srcpkg *srcpkg = pkgname->use[i];
-		/* skip edges not used in this build */
-		if (!(srcpkg->flags & FLAG_WORK))
-			continue;
-		if (--srcpkg->nblock == 0)
-			queue(srcpkg);
-	}
+	build->flags |= FLAG_DEPS;
 }
 
 static size_t maxjobs = 1;
@@ -511,18 +480,19 @@ static bool dryrun = false;
 struct job {
 	size_t next;
 	int status;
-	struct srcpkg *srcpkg;
+	struct build *build;
 	pid_t pid;
 	bool failed;
 };
 
-static void buildadd(struct pkgname *pkgname);
+static void buildadd(struct pkgname *pkgname, struct builder *builder);
 
 static void
 gendepdone(struct job *j)
 {
 	char path1[PATH_MAX], path2[PATH_MAX];
-	const char *name = j->srcpkg->pkgname->name;
+	struct build *build = j->build;
+	const char *name = build->pkgname->name;
 
 	if (WIFEXITED(j->status) && WEXITSTATUS(j->status) != 0) {
 		fprintf(stderr, "job failed: %s\n", name);
@@ -530,21 +500,32 @@ gendepdone(struct job *j)
 	}
 
 	if (j->failed) {
-		xsnprintf(path1, sizeof path1, "deps/%s.dep.tmp", name);
+		if (build->builder->host)
+			xsnprintf(path1, sizeof path1, "deps/%s@%s/%s.dep.tmp", build->builder->arch, build->builder->host->arch, name);
+		else
+			xsnprintf(path1, sizeof path1, "deps/%s/%s.dep.tmp", build->builder->arch, name);
 		if (unlink(path1) == -1) {
 			if (errno != ENOENT) {
 				fprintf(stderr, "unlink: %s: %s\n", path1, strerror(errno));
 				exit(1);
 			}
 		}
-		xsnprintf(path1, sizeof path1, "deps/%s.err.tmp", name);
-		xsnprintf(path2, sizeof path2, "deps/%s.err", name);
+		if (build->builder->host) {
+			xsnprintf(path1, sizeof path1, "deps/%s@%s/%s.err.tmp", build->builder->arch, build->builder->host->arch, name);
+			xsnprintf(path2, sizeof path2, "deps/%s@%s/%s.err", build->builder->arch, build->builder->host->arch, name);
+		} else {
+			xsnprintf(path1, sizeof path1, "deps/%s/%s.err.tmp", build->builder->arch, name);
+			xsnprintf(path2, sizeof path2, "deps/%s/%s.err", build->builder->arch, name);
+		}
 		if (rename(path1, path2) == -1) {
 			fprintf(stderr, "rename: %s: %s\n", path1, strerror(errno));
 			exit(1);
 		}
 	} else {
-		xsnprintf(path1, sizeof path1, "deps/%s.err.tmp", name);
+		if (build->builder->host)
+			xsnprintf(path1, sizeof path1, "deps/%s@%s/%s.err.tmp", build->builder->arch, build->builder->host->arch, name);
+		else
+			xsnprintf(path1, sizeof path1, "deps/%s/%s.err.tmp", build->builder->arch, name);
 		if (unlink(path1) == -1) {
 			if (errno != ENOENT) {
 				fprintf(stderr, "unlink: %s: %s\n", path1, strerror(errno));
@@ -552,44 +533,62 @@ gendepdone(struct job *j)
 			}
 		}
 
-		xsnprintf(path1, sizeof path1, "deps/%s.dep.tmp", name);
-		xsnprintf(path2, sizeof path2, "deps/%s.dep", name);
+		if (build->builder->host) {
+			xsnprintf(path1, sizeof path1, "deps/%s@%s/%s.dep.tmp", build->builder->arch, build->builder->host->arch, name);
+			xsnprintf(path2, sizeof path2, "deps/%s@%s/%s.dep", build->builder->arch, build->builder->host->arch, name);
+		} else {
+			xsnprintf(path1, sizeof path1, "deps/%s/%s.dep.tmp", build->builder->arch, name);
+			xsnprintf(path2, sizeof path2, "deps/%s/%s.dep", build->builder->arch, name);
+		}
 		if (rename(path1, path2) == -1) {
 			fprintf(stderr, "rename: %s: %s\n", path1, strerror(errno));
 			exit(1);
 		}
 
-		j->srcpkg->flags &= ~FLAG_WORK;
-		depstat(j->srcpkg);
-		buildadd(j->srcpkg->pkgname);
+		build->flags &= ~FLAG_WORK;
+		depstat(build);
+		buildadd(build->pkgname, build->builder);
 	}
 }
 
 static int
-gendepstart(struct job *j, struct srcpkg *srcpkg)
+gendepstart(struct job *j, struct build *build)
 {
 	extern char **environ;
 	char path[PATH_MAX];
 	posix_spawn_file_actions_t actions;
-	char *argv[] = {NULL, "dbulk-dump", srcpkg->pkgname->name, NULL};
+	char *Nargv[] = {NULL, "", "dbulk-dump", build->pkgname->name, NULL};
+	char *Xargv[] = {NULL, "-a", build->builder->arch, "dbulk-dump", build->pkgname->name, NULL};
+	char **argv;
 	int stdoutfd, stderrfd;
 
 	j->failed = false;
-	j->srcpkg = srcpkg;
+	j->build = build;
 	j->status = 0;
 
-	xsnprintf(path, sizeof path, "deps/%s.dep.tmp", srcpkg->pkgname->name);
+	if (build->builder->host)
+		xsnprintf(path, sizeof path, "deps/%s@%s/%s.dep.tmp", build->builder->arch, build->builder->host->arch, build->pkgname->name);
+	else
+		xsnprintf(path, sizeof path, "deps/%s/%s.dep.tmp", build->builder->arch, build->pkgname->name);
 	stdoutfd = open(path, O_WRONLY|O_CREAT|O_TRUNC, 0644);
 	if (stdoutfd == -1) {
 		fprintf(stderr, "open: %s: %s\n", path, strerror(errno));
 		exit(1);
 	}
-	xsnprintf(path, sizeof path, "deps/%s.err.tmp", srcpkg->pkgname->name);
+	if (build->builder->host)
+		xsnprintf(path, sizeof path, "deps/%s@%s/%s.err.tmp", build->builder->arch, build->builder->host->arch, build->pkgname->name);
+	else
+		xsnprintf(path, sizeof path, "deps/%s/%s.err.tmp", build->builder->arch, build->pkgname->name);
 	stderrfd = open(path, O_WRONLY|O_CREAT|O_TRUNC, 0644);
 	if (stderrfd == -1) {
 		fprintf(stderr, "open: %s: %s\n", path, strerror(errno));
 		exit(1);
 	}
+
+	if (build->builder->host)
+		argv = Xargv;
+	else
+		argv = Nargv;
 
 	xsnprintf(path, sizeof path, "%s/xbps-src", distdir);
 	argv[0] = path;
@@ -611,7 +610,7 @@ gendepstart(struct job *j, struct srcpkg *srcpkg)
 		goto err2;
 	}
 	if ((errno = posix_spawn(&j->pid, argv[0], &actions, NULL, argv, environ))) {
-		fprintf(stderr, "posix_spawn: %s: %s\n", srcpkg->pkgname->name, strerror(errno));
+		fprintf(stderr, "posix_spawn: %s: %s\n", build->pkgname->name, strerror(errno));
 		goto err2;
 	}
 	posix_spawn_file_actions_destroy(&actions);
@@ -630,11 +629,16 @@ err0:
 }
 
 static void
-srcpkgdone(struct srcpkg *srcpkg)
+pkgnamedone(struct pkgname *pkgname, bool prune)
 {
-	pkgnamedone(srcpkg->pkgname, false);
-	for (size_t i = 0; i < srcpkg->nsubpkgs; ++i) {
-		pkgnamedone(srcpkg->subpkgs[i], false);
+	pkgname->dirty = false;
+	for (size_t i = 0; i < pkgname->nuse; i++) {
+		struct build *build = pkgname->use[i];
+		/* skip edges not used in this build */
+		if (!(build->flags & FLAG_WORK))
+			continue;
+		if (--build->nblock == 0)
+			queue(build);
 	}
 }
 
@@ -642,54 +646,78 @@ static void
 builddone(struct job *j)
 {
 	char path1[PATH_MAX], path2[PATH_MAX];
-	const char *name = j->srcpkg->pkgname->name;
-	const char *version = j->srcpkg->version;
-	const char *revision = j->srcpkg->revision;
+	struct build *build = j->build;
+	const char *name = build->pkgname->name;
+	const char *version = build->version;
+	const char *revision = build->revision;
 
 	if (WIFEXITED(j->status) && WEXITSTATUS(j->status) != 0) {
-		fprintf(stderr, "job failed: %s\n", j->srcpkg->pkgname->name);
+		fprintf(stderr, "job failed: %s\n", name);
 		j->failed = true;
 	}
 
 	if (j->failed) {
-		xsnprintf(path1, sizeof path1, "logs/%s-%s_%s.tmp", name, version, revision);
-		xsnprintf(path2, sizeof path2, "logs/%s-%s_%s.err", name, version, revision);
+		if (build->builder->host) {
+			xsnprintf(path1, sizeof path1, "logs/%s@%s/%s-%s_%s.tmp", build->builder->arch, build->builder->host->arch, name, version, revision);
+			xsnprintf(path2, sizeof path2, "logs/%s@%s/%s-%s_%s.err", build->builder->arch, build->builder->host->arch, name, version, revision);
+		} else {
+			xsnprintf(path1, sizeof path1, "logs/%s/%s-%s_%s.tmp", build->builder->arch, name, version, revision);
+			xsnprintf(path2, sizeof path2, "logs/%s/%s-%s_%s.err", build->builder->arch, name, version, revision);
+		}
 		if (rename(path1, path2) == -1) {
 			fprintf(stderr, "rename: %s: %s\n", path1, strerror(errno));
 			exit(1);
 		}
 	} else {
-		xsnprintf(path1, sizeof path1, "logs/%s-%s_%s.tmp", name, version, revision);
-		xsnprintf(path2, sizeof path2, "logs/%s-%s_%s.log", name, version, revision);
+		if (build->builder->host) {
+			xsnprintf(path1, sizeof path1, "logs/%s@%s/%s-%s_%s.tmp", build->builder->arch, build->builder->host->arch, name, version, revision);
+			xsnprintf(path2, sizeof path2, "logs/%s@%s/%s-%s_%s.log", build->builder->arch, build->builder->host->arch, name, version, revision);
+		} else {
+			xsnprintf(path1, sizeof path1, "logs/%s/%s-%s_%s.tmp", build->builder->arch, name, version, revision);
+			xsnprintf(path2, sizeof path2, "logs/%s/%s-%s_%s.log", build->builder->arch, name, version, revision);
+		}
 		if (rename(path1, path2) == -1) {
 			fprintf(stderr, "rename: %s: %s\n", path1, strerror(errno));
 			exit(1);
 		}
 
-		srcpkgdone(j->srcpkg);
+		build->flags &= ~FLAG_DIRTY;
+		pkgnamedone(build->pkgname, false);
+		for (size_t i = 0; i < build->nsubpkgs; i++) {
+			pkgnamedone(build->subpkgs[i], false);
+		}
 	}
 }
 
 static int
-buildstart(struct job *j, struct srcpkg *srcpkg)
+buildstart(struct job *j, struct build *build)
 {
 	extern char **environ;
 	char path[PATH_MAX];
 	posix_spawn_file_actions_t actions;
-	char *argv[] = {NULL, "pkg", "-1Et", "-j", "4", srcpkg->pkgname->name, NULL};
+	char *Nargv[] = {NULL, "-1Et", "-j", "4", "pkg", build->pkgname->name, NULL};
+	char *Xargv[] = {NULL, "-a", build->builder->arch, "-1Et", "-j", "4", "pkg", build->pkgname->name, NULL};
+	char **argv;
 	int fd;
 
 	j->failed = false;
-	j->srcpkg = srcpkg;
+	j->build = build;
 	j->status = 0;
 
-	xsnprintf(path, sizeof path, "logs/%s-%s_%s.tmp", srcpkg->pkgname->name, srcpkg->version, srcpkg->revision);
+	if (build->builder->host)
+		xsnprintf(path, sizeof path, "logs/%s@%s/%s-%s_%s.tmp", build->builder->arch, build->builder->host->arch, build->pkgname->name, build->version, build->revision);
+	else
+		xsnprintf(path, sizeof path, "logs/%s/%s-%s_%s.tmp", build->builder->arch, build->pkgname->name, build->version, build->revision);
 	fd = open(path, O_WRONLY|O_CREAT|O_TRUNC, 0644);
 	if (fd == -1) {
 		perror("open");
 		exit(1);
 	}
 
+	if (build->builder->host)
+		argv = Xargv;
+	else
+		argv = Nargv;
 	xsnprintf(path, sizeof path, "%s/xbps-src", distdir);
 	argv[0] = path;
 
@@ -710,7 +738,7 @@ buildstart(struct job *j, struct srcpkg *srcpkg)
 		goto err2;
 	}
 	if ((errno = posix_spawn(&j->pid, argv[0], &actions, NULL, argv, environ))) {
-		fprintf(stderr, "posix_spawn: %s: %s\n", srcpkg->pkgname->name, strerror(errno));
+		fprintf(stderr, "posix_spawn: %s: %s\n", build->pkgname->name, strerror(errno));
 		goto err2;
 	}
 	posix_spawn_file_actions_destroy(&actions);
@@ -727,12 +755,12 @@ err0:
 }
 
 static int
-jobstart(struct job *j, struct srcpkg *srcpkg)
+jobstart(struct job *j, struct build *build)
 {
-	if (srcpkg->flags & FLAG_DEPS) {
-		return buildstart(j, srcpkg);
+	if (build->flags & FLAG_DEPS) {
+		return buildstart(j, build);
 	} else {
-		return gendepstart(j, srcpkg);
+		return gendepstart(j, build);
 	}
 }
 
@@ -743,17 +771,186 @@ jobdone(struct job *j)
 	if (WIFEXITED(j->status)) {
 		; /* exit status is handled by builddone and gendepdone */
 	} else if (WIFSIGNALED(j->status)) {
-		fprintf(stderr, "job terminated due to signal %d: %s\n", WTERMSIG(j->status), j->srcpkg->pkgname->name);
+		fprintf(stderr, "job terminated due to signal %d: %s\n", WTERMSIG(j->status), j->build->pkgname->name);
 		j->failed = true;
 	} else {
 		/* cannot happen according to POSIX */
-		fprintf(stderr, "job status unknown: %s\n", j->srcpkg->pkgname->name);
+		fprintf(stderr, "job status unknown: %s\n", j->build->pkgname->name);
 		j->failed = true;
 	}
-	if (j->srcpkg->flags & FLAG_DEPS) {
+	if (j->build->flags & FLAG_DEPS) {
 		builddone(j);
 	} else {
 		gendepdone(j);
+	}
+}
+
+static struct build *
+mkbuild(struct pkgname *pkgname, struct builder *builder)
+{
+	struct build *build;
+	build = xzmalloc(sizeof *build);
+	build->builder = builder;
+	build->pkgname = pkgname;
+	build->allnext = builds;
+	build->depmtime = MTIME_UNKNOWN;
+	build->deperrmtime = MTIME_UNKNOWN;
+	build->logmtime = MTIME_UNKNOWN;
+	build->logerrmtime = MTIME_UNKNOWN;
+	builds = build;
+	pkgnamebuild(pkgname, build);
+	return build;
+}
+
+static int
+_buildadd(struct pkgname *pkgname, struct builder *builder)
+{
+	struct build *build = NULL;
+
+	if (pkgname->mtime == MTIME_UNKNOWN) {
+		pkgnamestat(pkgname);
+		if (pkgname->mtime == MTIME_MISSING) {
+			build->flags |= FLAG_SKIP|FLAG_DIRTY;
+			if (explain)
+				fprintf(stderr, "explain: %s: skipping, no template to build package\n", pkgname->name);
+			goto out;
+		}
+	}
+	
+	struct pkgname *srcpkg = pkgname->srcpkg ? pkgname->srcpkg : pkgname;
+	for (size_t i = 0; i < srcpkg->nbuilds; i++) {
+		if (srcpkg->builds[i]->builder == builder) {
+			build = srcpkg->builds[i];
+			break;
+		}
+	}
+	if (!build)
+		build = mkbuild(srcpkg, builder);
+
+	if (build->flags & FLAG_CYCLE) {
+		build->flags |= FLAG_SKIP|FLAG_DIRTY;
+		if (explain)
+			fprintf(stderr, "explain: %s: skipping, dependency cycle involving: %s", pkgname->name, pkgname->name);
+		goto err;
+	}
+	if (build->flags & FLAG_WORK)
+		return 0;
+
+	build->flags |= FLAG_CYCLE|FLAG_WORK;
+	build->flags &= ~FLAG_DIRTY;
+
+	/* build->pkgname->dirty = false; */
+	/* if (build->pkgname->mtime == MTIME_UNKNOWN) */
+	/* 	pkgnamestat(build->pkgname); */
+	for (size_t i = 0; i < build->nsubpkgs; i++) {
+		struct pkgname *n1 = build->subpkgs[i];
+		/* build->pkgname->dirty = false; */
+		/* if (n1->mtime == MTIME_UNKNOWN) */
+		/* 	pkgnamestat(n1); */
+	}
+
+	if (build->depmtime == MTIME_UNKNOWN)
+		depstat(build);
+
+	/* dep file missing or outdated */
+	if (build->depmtime < build->pkgname->mtime) {
+		/* depfile error missing or older than template, regenerate it */
+		if (build->deperrmtime < build->pkgname->mtime) {
+			/* XXX: order is irrelevant, but would ordering still make sense
+			 * to prioritize building packages over generating deps in
+			 * case we have an old dep file? */
+			if (explain)
+				fprintf(stderr, "explain %s: dependency file %s\n", build->pkgname->name,
+				    build->depmtime == MTIME_MISSING ? "missing" : "older than template");
+			build->flags |= FLAG_DIRTY;
+			build->nblock = 0;
+			goto out;
+		} else {
+			build->flags |= FLAG_SKIP|FLAG_DIRTY;
+			if (explain)
+				fprintf(stderr, "explain %s: skipping, template unchanged since previous error\n", build->pkgname->name);
+			goto out;
+		}
+	}
+
+	loaddeps(build);
+	if ((build->flags & FLAG_DEPS)) {
+		logstat(build);
+		if (build->logmtime == MTIME_MISSING) {
+			if (build->logerrmtime == MTIME_MISSING) {
+				/* Build the package if log and error mtime are missing */
+				if (explain)
+					fprintf(stderr, "explain %s: missing\n", build->pkgname->name);
+				build->flags |= FLAG_DIRTY;
+			} else if (build->logerrmtime < build->pkgname->mtime) {
+				/* Build the package if log mtime is missing and error mtime is older than the template */
+				if (explain)
+					fprintf(stderr, "explain %s: reattempt, template changed since previous error\n", build->pkgname->name);
+				build->flags |= FLAG_DIRTY;
+			} else {
+				build->flags |= FLAG_SKIP|FLAG_DIRTY;
+				if (explain)
+					fprintf(stderr, "explain %s: skipping, template unchanged since previous error\n", build->pkgname->name);
+				goto out;
+			}
+		}
+
+		build->nblock = 0;
+		struct builder *hostbuilder = builder->host ? builder->host : builder;
+		for (size_t i = 0; i < build->nhostdeps; i++) {
+			struct pkgname *n1 = build->hostdeps[i];
+			int flags = _buildadd(n1, hostbuilder);
+			if (flags & FLAG_CYCLE) {
+				build->flags |= FLAG_SKIP|FLAG_DIRTY;
+				fprintf(stderr, " <- %s", pkgname->name);
+				goto err;
+			}
+			if (flags & FLAG_DIRTY)
+				build->nblock++;
+		}
+
+		for (size_t i = 0; i < build->ntargetdeps; i++) {
+			struct pkgname *n1 = build->targetdeps[i];
+			int flags = _buildadd(n1, builder);
+			if (flags & FLAG_CYCLE) {
+				build->flags |= FLAG_SKIP|FLAG_DIRTY;
+				fprintf(stderr, " <- %s", pkgname->name);
+				goto err;
+			}
+			if (flags & FLAG_DIRTY)
+				build->nblock++;
+		}
+	}
+
+out:
+	build->flags &= ~FLAG_CYCLE;
+err:
+	if (build->flags & FLAG_DIRTY) {
+		/* Missing deps or missing package, mark all packages as dirty */
+		build->pkgname->dirty = true;
+		for (size_t i = 0; i < build->nsubpkgs; i++) {
+			struct pkgname *n1 = build->subpkgs[i];
+			n1->dirty = true;
+		}
+
+		if (!(build->flags & FLAG_SKIP)) {
+			if (build->nblock == 0)
+				queue(build);
+			numtotal++;
+		}
+	}
+	return build->flags;
+}
+
+static void
+buildadd(struct pkgname *pkgname, struct builder *builder)
+{
+	int rv;
+	if ((rv = _buildadd(pkgname, builder)) != 0) {
+		if (rv == ELOOP) {
+			fprintf(stderr, "\n");
+			return;
+		}
 	}
 }
 
@@ -776,21 +973,25 @@ build(void)
 	for (;;) {
 nextjob:
 		while (work && numjobs < maxjobs) {
-			struct srcpkg *srcpkg = work;
+			struct build *build = work;
 			work = work->worknext;
 			if (dryrun) {
-				pkgnamedone(srcpkg->pkgname, false);
-				for (size_t i = 0; i < srcpkg->nsubpkgs; i++) {
-					pkgnamedone(srcpkg->subpkgs[i], false);
+				numfinished++;
+				fprintf(stderr, "[%zu/%zu] build %s\n", numfinished, numtotal, build->pkgname->name);
+				pkgnamedone(build->pkgname, false);
+				for (size_t i = 0; i < build->nsubpkgs; i++) {
+					pkgnamedone(build->subpkgs[i], false);
 				}
 				continue;
 			}
 
-			if (jobstart(&jobs[next], srcpkg) == -1) {
-				fprintf(stderr, "job failed to start: %s\n", srcpkg->pkgname->name);
+			if (jobstart(&jobs[next], build) == -1) {
+				fprintf(stderr, "job failed to start: %s\n", build->pkgname->name);
 				numfail++;
 				continue;
 			}
+			const char *action = jobs[next].build->flags & FLAG_DEPS ? "build package" : "generated dependencies for";
+			/* fprintf(stderr, "[%zu/%zu] %s %s pid=%zu\n", numfinished, numtotal, action, jobs[next].build->pkgname->name, jobs[next].pid); */
 			next = jobs[next].next;
 			numjobs++;
 		}
@@ -809,7 +1010,7 @@ nextjob:
 			for (size_t i = 0; i < maxjobs; i++) {
 				if (jobs[i].pid != pid)
 					continue;
-				const char *action = jobs[i].srcpkg->flags & FLAG_DEPS ? "build package" : "generated dependencies for";
+				const char *action = jobs[i].build->flags & FLAG_DEPS ? "build package" : "generated dependencies for";
 				jobs[i].status = status;
 				jobdone(&jobs[i]);
 				numjobs--;
@@ -818,7 +1019,7 @@ nextjob:
 				next = i;
 				if (jobs[i].failed)
 					numfail++;
-				fprintf(stderr, "[%zu/%zu] %s %s\n", numfinished, numtotal, action, jobs[i].srcpkg->pkgname->name);
+				fprintf(stderr, "[%zu/%zu] %s %s\n", numfinished, numtotal, action, jobs[i].build->pkgname->name);
 				goto nextjob;
 			}
 		}
@@ -850,190 +1051,20 @@ scan(void)
 		struct stat st;
 		if (*ent->d_name == '.')
 			continue;
-		if (fstatat(dirfd, ent->d_name, &st, AT_SYMLINK_NOFOLLOW) == -1) {
-			perror("fstat");
-			exit(1);
-		}
-
 		struct pkgname *pkgname = mkpkgname(ent->d_name);
-		pkgname->mtime = st.st_mtime;
-		struct srcpkg *srcpkg = pkgname->srcpkg;
-
-		if (st.st_mode & S_IFDIR) {
-			/* setup_pkg_target(n); */
-		} else if (st.st_mode & S_IFLNK) {
-			ssize_t len;
-			if ((len = readlinkat(dirfd, ent->d_name, buf, sizeof buf)) == -1) {
-				perror("readlink");
-				exit(1);
-			}
-			if ((size_t)len >= sizeof buf) {
-				errno = ENOBUFS;
-				perror("readlink");
-				exit(1);
-			}
-			buf[len] = '\0';
-
-			if (len > 0 && buf[len-1] == '/') {
-				fprintf(stderr, "warn: symlink `%s/srcpkgs/%s` contains trailing slash.\n", distdir, ent->d_name);
-				buf[len-1] = '\0';
-			}
-			struct pkgname *srcpkgname = mkpkgname(buf);
-			if (!srcpkgname->srcpkg) {
-				srcpkgname->srcpkg = mksrcpkg(srcpkgname);
-			}
-		}
 	}
 	closedir(dp);
 	close(dirfd);
 }
 
-static int
-_buildadd(struct pkgname *pkgname)
-{
-	struct srcpkg *srcpkg = pkgname->srcpkg;
-	int rv = 0;
-
-	if (!srcpkg) {
-		srcpkg->flags |= FLAG_SKIP|FLAG_DIRTY;
-		if (explain)
-			fprintf(stderr, "explain: %s: skipping, no template to build package\n", pkgname->name);
-		rv = ENOENT;
-		goto out;
-	}
-	if (srcpkg->flags & FLAG_CYCLE) {
-		srcpkg->flags |= FLAG_SKIP|FLAG_DIRTY;
-		if (explain)
-			fprintf(stderr, "explain: %s: skipping, dependency cycle involving: %s", pkgname->name, pkgname->name);
-		rv = ELOOP;
-		goto out;
-	}
-	if (srcpkg->flags & FLAG_WORK)
-		return 0;
-
-	srcpkg->flags |= FLAG_CYCLE | FLAG_WORK;
-
-	if (srcpkg->pkgname->mtime == MTIME_UNKNOWN)
-		pkgnamestat(srcpkg->pkgname);
-	for (size_t i = 0; i < srcpkg->nsubpkgs; i++) {
-		struct pkgname *n1 = srcpkg->subpkgs[i];
-		if (n1->mtime == MTIME_UNKNOWN)
-			pkgnamestat(n1);
-	}
-
-	if (srcpkg->depmtime == MTIME_UNKNOWN)
-		depstat(srcpkg);
-
-	/* dep file missing or outdated */
-	if (srcpkg->depmtime < srcpkg->pkgname->mtime) {
-		/* depfile error missing or older than template, regenerate it */
-		if (srcpkg->deperrmtime < srcpkg->pkgname->mtime) {
-			/* XXX: order is irrelevant, but would ordering still make sense
-			 * to prioritize building packages over generating deps in
-			 * case we have an old dep file? */
-			if (explain)
-				fprintf(stderr, "explain %s: dependency file %s\n", srcpkg->pkgname->name,
-				    srcpkg->depmtime == MTIME_MISSING ? "missing" : "older than template");
-			srcpkg->flags |= FLAG_DIRTY;
-			srcpkg->nblock = 0;
-			goto out;
-		} else {
-			srcpkg->flags |= FLAG_SKIP|FLAG_DIRTY;
-			if (explain)
-				fprintf(stderr, "explain %s: skipping, template unchanged since previous error\n", srcpkg->pkgname->name);
-			goto out;
-		}
-	}
-
-	if (srcpkg->depmtime > MTIME_MISSING)
-		loaddeps(srcpkg);
-
-	if ((srcpkg->flags & FLAG_DEPS)) {
-
-		logstat(srcpkg);
-		if (srcpkg->logmtime == MTIME_MISSING) {
-			if (srcpkg->logerrmtime == MTIME_MISSING) {
-				/* Build the package if log and error mtime are missing */
-				if (explain)
-					fprintf(stderr, "explain %s: missing\n", srcpkg->pkgname->name);
-				srcpkg->flags |= FLAG_DIRTY;
-			} else if (srcpkg->logerrmtime < srcpkg->pkgname->mtime) {
-				/* Build the package if log mtime is missing and error mtime is older than the template */
-				if (explain)
-					fprintf(stderr, "explain %s: reattempt, template changed since previous error\n", srcpkg->pkgname->name);
-				srcpkg->flags |= FLAG_DIRTY;
-			} else {
-				srcpkg->flags |= FLAG_SKIP|FLAG_DIRTY;
-				if (explain)
-					fprintf(stderr, "explain %s: skipping, template unchanged since previous error\n", srcpkg->pkgname->name);
-				goto out;
-			}
-		}
-
-		for (size_t i = 0; i < srcpkg->nhostdeps; i++) {
-			struct pkgname *n1 = srcpkg->hostdeps[i];
-			if ((rv = _buildadd(n1)) != 0) {
-				if (rv == ELOOP) {
-					srcpkg->flags |= FLAG_SKIP|FLAG_DIRTY;
-					fprintf(stderr, " <- %s", pkgname->name);
-				}
-				goto out;
-			}
-			if (n1->dirty)
-				srcpkg->nblock++;
-		}
-
-		for (size_t i = 0; i < srcpkg->ntargetdeps; i++) {
-			struct pkgname *n1 = srcpkg->targetdeps[i];
-			if ((rv = _buildadd(n1)) != 0) {
-				if (rv == ELOOP) {
-					srcpkg->flags |= FLAG_SKIP|FLAG_DIRTY;
-					fprintf(stderr, " <- %s", pkgname->name);
-				}
-				goto out;
-			}
-			if (n1->dirty)
-				srcpkg->nblock++;
-		}
-	}
-
-out:
-	if (srcpkg->flags & FLAG_DIRTY) {
-		/* Missing deps or missing package, mark all packages as dirty */
-		srcpkg->pkgname->dirty = true;
-		for (size_t i = 0; i < srcpkg->nsubpkgs; i++) {
-			struct pkgname *n1 = srcpkg->subpkgs[i];
-			n1->dirty = true;
-		}
-
-		if (!(srcpkg->flags & FLAG_SKIP)) {
-			if (srcpkg->nblock == 0)
-				queue(srcpkg);
-			numtotal++;
-		}
-	}
-	srcpkg->flags &= ~FLAG_CYCLE;
-	return rv;
-}
-
-static void
-buildadd(struct pkgname *pkgname)
-{
-	int rv;
-	if ((rv = _buildadd(pkgname)) != 0) {
-		if (rv == ELOOP) {
-			fprintf(stderr, "\n");
-			return;
-		}
-	}
-}
 int
 main(int argc, char *argv[])
 {
 	int c;
 	unsigned long ul;
+	const char *tool = NULL;
 
-	while ((c = getopt(argc, argv, "dD:j:n")) != -1)
+	while ((c = getopt(argc, argv, "dD:j:nt:")) != -1)
 		switch (c) {
 		case 'd':
 			explain = true;
@@ -1053,12 +1084,19 @@ main(int argc, char *argv[])
 		case 'n':
 			dryrun = true;
 			break;
+		case 't':
+			tool = optarg;
+			break;
 		default:
 			fprintf(stderr, "usage: %s [-den] [-D distdir] [-j jobs] [target...]\n", *argv);
 		}
 
 	argc -= optind;
 	argv += optind;
+
+	struct builder *host = mkbuilder("x86_64");
+	struct builder *cross = mkbuilder("aarch64");
+	cross->host = host;
 
 	if (!distdir) {
 		static char defdistdir[PATH_MAX];
@@ -1082,16 +1120,20 @@ main(int argc, char *argv[])
 
 	if (argc > 0) {
 		for (int i = 0; i < argc; i++) {
-			buildadd(addpkg(argv[i]));
+			/* buildadd(mkpkgname(argv[i]), host); */
+			buildadd(mkpkgname(argv[i]), cross);
 		}
 	} else {
+		struct pkgname *pkgname, *tmp;
 		scan();
 		/* build all packages */
-		for (struct srcpkg *srcpkg = srcpkgs; srcpkg; srcpkg = srcpkg->allnext) {
-			buildadd(srcpkg->pkgname);
+		HASH_ITER(hh, pkgnames, pkgname, tmp) {
+			/* buildadd(pkgname, host); */
+			buildadd(pkgname, cross);
 		}
 	}
 
-	build();
+	if (!tool)
+		build();
 	return 0;
 }
