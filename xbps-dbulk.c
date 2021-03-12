@@ -1157,16 +1157,18 @@ main(int argc, char *argv[])
 
 	if (argc > 0) {
 		for (int i = 0; i < argc; i++) {
-			/* buildadd(mkpkgname(argv[i]), host); */
-			buildadd(mkpkgname(argv[i]), cross);
+			HASH_ITER(hh, builders, builder, tmpbuilder) {
+				buildadd(mkpkgname(argv[i]), builder);
+			}
 		}
 	} else {
 		struct pkgname *pkgname, *tmp;
 		scan();
 		/* build all packages */
 		HASH_ITER(hh, pkgnames, pkgname, tmp) {
-			/* buildadd(pkgname, host); */
-			buildadd(pkgname, cross);
+			HASH_ITER(hh, builders, builder, tmpbuilder) {
+				buildadd(pkgname, builder);
+			}
 		}
 	}
 
